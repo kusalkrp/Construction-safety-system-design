@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  safety-api:
+    build:
+      context: ..
+      dockerfile: serving/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=False
+      - LOG_LEVEL=INFO
+      - MODEL_WEIGHTS_PATH=/app/weights/best.pt
+      - RULES_CONFIG_PATH=/app/rules.yaml
+      - ALLOWED_ORIGINS=http://localhost:3000
+    volumes:
+      # Mount local weights — download from GitHub Release first:
+      # https://github.com/<owner>/construction-safety/releases/latest
+      - ./weights:/app/weights:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

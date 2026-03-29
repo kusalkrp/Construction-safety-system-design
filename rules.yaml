@@ -1,0 +1,80 @@
+# Construction Safety Monitor — Machine-Readable Rule Definitions
+# This file is the single source of truth for all thresholds.
+# Consumed by inference/constants.py — never hardcode these values inline.
+
+# ── Detection thresholds ──────────────────────────────────────────────────────
+# Runtime gate: --conf 0.30 discards noise below YOLO reliability floor (applied in pipeline.py)
+detection:
+  high_confidence_threshold: 0.70       # composite rule_confidence >= this → HIGH tier → immediate alert
+  medium_confidence_threshold: 0.45     # composite rule_confidence >= this → MEDIUM tier → review queue
+                                        # below 0.45 → LOW tier → logged only, insufficient certainty for alert
+  partial_compliance_conf_low: 0.35     # raw YOLO conf lower bound for Rule 3 — captures borderline PPE for human review
+  partial_compliance_conf_high: 0.65    # upper bound — above this model is confident enough to classify definitively
+  violation_conf_min: 0.40              # lowered from 0.50 — recovers ~7% recall on no_helmet at no precision cost
+
+# ── Bounding box thresholds ───────────────────────────────────────────────────
+bbox:
+  far_field_height_px: 40              # person bbox height < this → Rule 4 (unverifiable)
+  rule_confidence_bbox_normalise: 80   # bbox_size_factor = min(1.0, height / this)
+  crowd_iou_threshold: 0.50            # IoU > this between person boxes → crowd ambiguous
+  ppe_person_overlap_iou: 0.10         # IoU > this required to associate PPE box with worker
+
+# ── Frame geometry ────────────────────────────────────────────────────────────
+frame:
+  elevation_zone_ratio: 0.60           # upper X% of frame → CRITICAL-ELEVATED (Rule 1)
+  visitor_edge_px: 30                  # person within this many px of frame edge → visitor heuristic
+
+# ── rule_confidence weights ───────────────────────────────────────────────────
+confidence_weights:
+  detection_conf: 0.60
+  bbox_size_factor: 0.25
+  edge_factor: 0.15
+
+# ── Compliance score ──────────────────────────────────────────────────────────
+score:
+  critical_deduction: 25
+  high_deduction: 15
+  warning_deduction: 5
+  crowd_multiplier: 1.3                # applied when Rule 6 triggers
+  temporal_decay_interval_s: 60        # violations older than this decay
+  temporal_decay_rate: 0.50            # decay per interval (50% per minute)
+
+# ── Score bands ───────────────────────────────────────────────────────────────
+score_bands:
+  compliant_min: 80      # 80–100 → COMPLIANT (green)
+  caution_min: 60        # 60–79  → CAUTION   (amber)
+  at_risk_min: 40        # 40–59  → AT RISK   (orange)
+                         # 0–39   → CRITICAL  (red)
+
+# ── Rule 6 — Site-level crowd non-compliance ─────────────────────────────────
+crowd:
+  min_workers: 4                       # minimum workers detected to trigger Rule 6
+  violation_ratio_threshold: 0.50      # >= 50% non-compliant → site-level alert
+  crowd_violation_conf_min: 0.60       # minimum rule_confidence to count toward ratio
+
+# ── Video temporal analysis ───────────────────────────────────────────────────
+temporal:
+  window_frames: 30                    # sliding window size (~1s at 30fps)
+  sustained_ratio: 0.70               # ratio > this → SUSTAINED VIOLATION → alert
+  intermittent_ratio_low: 0.20        # ratio < this → likely false positive → discard
+  score_history_interval_s: 10        # log compliance score every N seconds
+
+# ── Scene classifier heuristic (Rule 2 indoor/outdoor) ───────────────────────
+scene:
+  sky_sample_top_ratio: 0.20          # examine top X% of frame for sky detection
+  sky_blue_hue_low: 90                # HSV hue range for sky blue
+  sky_blue_hue_high: 140
+  sky_saturation_min: 30              # minimum saturation to be considered sky (not white)
+  sky_pixel_ratio_outdoor: 0.15       # >= X% sky pixels in sample → outdoor
+
+# ── Classes ───────────────────────────────────────────────────────────────────
+classes:
+  helmet_on: 0
+  no_helmet: 1
+  vest_on: 2
+  no_vest: 3
+  person: 4
+  mask_on: 5
+
+violation_classes: [no_helmet, no_vest]
+safe_classes: [helmet_on, vest_on, mask_on]
