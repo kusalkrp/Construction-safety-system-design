@@ -48,9 +48,15 @@ with 29 tests, none of which touch the model.
 - Expanded person bbox (60% upward) for IoU search — compensates for torso-anchored detections
 - `is_above_person` check — associates helmets sitting above the person box when IoU is near zero
 - Conflict suppression — when `helmet_on` and `no_helmet` overlap the same worker, the safe class
-  wins (spatial and confidence evidence both considered)
-- Anatomical position filter — `no_helmet` box in the lower body zone (below 60% frame height)
-  or `no_vest` box in the head zone (above 25% frame height) are rejected as mislocalizations
+  wins. Previously this silently discarded the report; it now surfaces as a `partial_compliance`
+  WARNING so the uncertainty is visible to operators
+- Anatomical position filter — `no_helmet` center below 60% frame height, or `no_vest` center in
+  the top 25% of frame, are rejected as physically impossible mislocalizations (silently discarded)
+- Per-class highest-confidence — when multiple boxes of the same class overlap a worker, the
+  strongest detection drives the rule rather than an arbitrary iteration-order winner
+- Rule 3 deduplication — one `partial_compliance` entry regardless of how many borderline
+  detections are present; bonus classes (`mask_on`) are excluded; detections already handled by
+  Rules 1/2 (conf ≥ `violation_conf_min`) are not also flagged as partial compliance
 
 ---
 
@@ -65,9 +71,9 @@ machine-readable in [`rules.yaml`](rules.yaml).
 | 1 (elevated) | same + upper 60% of frame | CRITICAL-ELEVATED |
 | 2 — No vest (outdoor) | `no_vest` conf ≥ 0.40, outdoor scene | HIGH |
 | 2 — No vest (indoor) | `no_vest` conf ≥ 0.40, indoor scene | WARNING |
-| 3 — Partial compliance | PPE conf 0.35–0.65 | WARNING → review queue |
+| 3 — Partial compliance | Required PPE conf 0.35–0.65; or conflicting safe+violation signal on same worker | WARNING → review queue |
 | 4 — Far-field worker | Person bbox height < 40px | UNVERIFIABLE |
-| 5 — Occlusion gap | Person detected, no PPE overlap | WARNING → review queue |
+| 5 — Occlusion gap | No PPE overlap, OR helmet detected but no vest-class, OR vest detected but no helmet-class | WARNING → review queue |
 | 6 — Crowd non-compliance | ≥ 4 workers, ≥ 50% violating | SITE ALERT |
 
 ---
@@ -210,12 +216,14 @@ The two safety-critical classes (no_helmet, no_vest) are the most important to e
 
 ---
 
+
+
 ## Known Failure Modes
 
 | Failure | What happens | Mitigation applied | Production fix |
 |---|---|---|---|
 | Mislocalized `no_helmet` at torso | False CRITICAL alert on compliant worker | Anatomical position filter + above-adjacent suppression | More close-up training data |
-| `helmet_on` / `no_helmet` conflict | Same worker gets both classes | Conflict suppression — safe class wins | Retrain with harder negative examples |
+| `helmet_on` / `no_helmet` conflict | Same worker gets both classes | Conflict suppression — safe class wins, surfaces as `partial_compliance` WARNING | Retrain with harder negative examples |
 | Far-field workers (< 40px bbox) | Flagged UNVERIFIABLE — no false compliance | Rule 4 (explicit capability flag) | PTZ camera with auto-zoom |
 | Person class missed (close-up) | Fallback to PPE-box-only reports | Fallback path + suppression in fallback | Improved person training data |
 | Night / low-light | Conf drops below threshold → review queue | Conservative default | IR-capable cameras |
@@ -413,8 +421,12 @@ proc = subprocess.Popen(["python", "demo.py"])
 pytest tests/ -v
 ```
 
-29 unit tests covering all 6 safety rules, score formula, temporal decay, suppression logic,
+37 unit tests covering all 6 safety rules, score formula, temporal decay, suppression logic,
 and edge cases. No tests touch the model — all rule logic is independently testable.
+
+New tests added in the latest revision cover: Rule 3 deduplication, Rule 3 exclusion of bonus
+classes and Rules 1/2 violations, fallback conflict → `partial_compliance` path, per-class
+highest-confidence selection, Rule 5 partial PPE coverage (helmet-only, vest-only, mask-only).
 
 ---
 
