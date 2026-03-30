@@ -18,6 +18,8 @@ actually needs.
 
 ## System Architecture
 
+Detailed architecture notes are in [`ARCHITECTURE.md`](ARCHITECTURE.md).
+
 ```
 Input Frame
     │
@@ -102,7 +104,7 @@ Tiers: HIGH ≥ 0.70 → immediate alert | MEDIUM ≥ 0.45 → review queue | LO
 
 ## Dataset
 
-Seven sources merged into one 6-class dataset. Full documentation: [`docs/DATASET.md`](docs/DATASET.md).
+Seven sources merged into one 6-class dataset. Full documentation: [`DATASET.md`](DATASET.md).
 
 | Source | Images | Key classes contributed |
 |---|---|---|
@@ -303,7 +305,8 @@ construction-safety/
 ├── inference/         # SafetyChecker, SiteScorer, Annotator, pipeline, scene_classifier
 ├── serving/           # FastAPI + Dockerfile + docker-compose
 ├── tests/             # 29 pytest unit tests
-├── docs/              # DATASET.md, per_class_metrics.csv, training curves, failure cases
+├── ARCHITECTURE.md    # detailed architecture and design notes
+├── DATASET.md         # dataset sources, mapping, and split details
 ├── dataset/
 │   ├── raw/           # original downloaded sources (never modified)
 │   ├── remapped/      # label-remapped copies (6-class schema)
