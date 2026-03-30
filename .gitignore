@@ -205,3 +205,30 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+.claude/
+
+# Project — model weights & training runs
+
+# Project — dataset (large binary files)
+dataset/images/
+dataset/labels/
+dataset/custom_labelled/
+dataset/augmented/
+
+# Project — scraped images (not committed; manifest CSV is committed)
+dataset/scraped/
+
+# Project — Label Studio
+label_studio_data/
+
+# Project — secrets
+.env
+CLAUDE.md
+implementation_plan.md
+Docs/
+DATASET_EXTENSION_GUIDE.md
+dataset/
+training/notebooks/yolov8n.pt
+training/notebooks/yolov8s.pt
+training/notebooks/yolov8m.pt
+training/notebooks/yolo11n.pt

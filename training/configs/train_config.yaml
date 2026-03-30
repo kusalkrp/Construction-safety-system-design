@@ -1,0 +1,48 @@
+# YOLOv8 Training Configuration — Construction Safety Monitor
+# Hardware target: NVIDIA RTX 3060 6GB VRAM (local)
+# Run: python training/train.py --config training/configs/train_config.yaml
+
+model: yolov8m.pt          # YOLOv8 medium — pretrained on COCO 2017
+                           # Why medium: fits 6GB VRAM at batch 8 @ imgsz 640;
+                           # better small-object detection than nano (needed for far-field PPE);
+                           # does not exceed VRAM like large/xl
+
+data: dataset/merged/data.yaml     # produced by scripts/merge_datasets.py
+
+imgsz: 640                 # standard COCO pretraining resolution; good small-object tradeoff
+batch: 16                  # safe for RTX 3060 6GB at imgsz 640 with CUDA PyTorch
+epochs: 50                 # sufficient for fine-tuning from pretrained weights
+patience: 15               # early stopping if val mAP does not improve for 15 epochs
+optimizer: AdamW           # outperforms SGD on fine-tuning with limited data; built-in weight decay
+lr0: 0.001                 # lower than scratch (0.01) — weights are pretrained
+lrf: 0.01                  # final lr = lr0 * lrf (cosine schedule)
+warmup_epochs: 3           # linear warmup
+weight_decay: 0.0005
+augment: true              # enable online augmentation: mosaic, flipud, HSV jitter
+                           # Note: offline augmentation is ADDITIONAL (augment_dataset.py)
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+degrees: 0.0               # no rotation — construction site cameras are fixed
+translate: 0.1
+scale: 0.5
+mosaic: 1.0
+mixup: 0.0
+copy_paste: 0.0
+
+# Class imbalance mitigation
+cls: 1.5                   # classification loss gain (default 0.5) — upweights cls loss,
+                           # helps minority violation classes (no_helmet 8.3%) compete with
+                           # dominant vest_on (40.6%) during gradient updates
+
+# Output
+project: runs
+name: train
+exist_ok: false
+save: true
+save_period: -1            # only save best and last
+cache: false               # set to true to cache images in RAM if > 16GB available
+workers: 4                 # dataloader workers (adjust for CPU count)
+device: 0                  # GPU device index (0 = first GPU, use 'cpu' for CPU-only)
+verbose: true
+plots: true                # save training plots (loss curves, confusion matrix, PR curve)
