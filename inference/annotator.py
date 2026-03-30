@@ -65,6 +65,30 @@ def _draw_label(
     cv2.putText(img, text, (x + pad, y - pad), FONT, LABEL_FONT_SCALE, (255, 255, 255), LABEL_THICKNESS, cv2.LINE_AA)
 
 
+def _draw_dashed_rect(
+    img: np.ndarray,
+    x1: int, y1: int, x2: int, y2: int,
+    colour: tuple[int, int, int],
+    dash_len: int = 8,
+) -> None:
+    """Draw a dashed rectangle — used for PPE violation boxes."""
+    pts = [
+        ((x1, y1), (x2, y1)),
+        ((x2, y1), (x2, y2)),
+        ((x2, y2), (x1, y2)),
+        ((x1, y2), (x1, y1)),
+    ]
+    for (ax, ay), (bx, by) in pts:
+        length = max(abs(bx - ax), abs(by - ay))
+        steps = max(1, length // (dash_len * 2))
+        for i in range(steps):
+            t0 = i * 2 * dash_len / length
+            t1 = min(1.0, (i * 2 + 1) * dash_len / length)
+            sx, sy = int(ax + t0 * (bx - ax)), int(ay + t0 * (by - ay))
+            ex, ey = int(ax + t1 * (bx - ax)), int(ay + t1 * (by - ay))
+            cv2.line(img, (sx, sy), (ex, ey), colour, 1, cv2.LINE_AA)
+
+
 def draw_annotations(
     frame_rgb: np.ndarray,
     worker_reports: list[ViolationReport],
@@ -95,6 +119,13 @@ def draw_annotations(
         colour = _severity_colour(report.severity)
 
         cv2.rectangle(out, (x1, y1), (x2, y2), colour, BOX_THICKNESS)
+
+        # Draw the PPE violation box (where no_helmet/no_vest was detected) as a
+        # thinner dashed rectangle so the viewer can see the actual detection location
+        # rather than just the person anchor box.
+        if report.violation_bbox is not None:
+            vx1, vy1, vx2, vy2 = report.violation_bbox
+            _draw_dashed_rect(out, vx1, vy1, vx2, vy2, colour)
 
         # Build label text
         if report.violations:

@@ -34,6 +34,9 @@ FAR_FIELD_BBOX_THRESHOLD_PX: int      = _cfg["bbox"]["far_field_height_px"]
 RULE_CONFIDENCE_BBOX_NORMALISE: float = _cfg["bbox"]["rule_confidence_bbox_normalise"]
 CROWD_IOU_THRESHOLD: float            = _cfg["bbox"]["crowd_iou_threshold"]
 PPE_PERSON_OVERLAP_IOU: float         = _cfg["bbox"]["ppe_person_overlap_iou"]
+PERSON_CROP_HEAD_EXPAND: float        = _cfg["bbox"]["person_crop_head_expand"]
+PPE_ABOVE_PERSON_X_OVERLAP: float     = _cfg["bbox"]["ppe_above_person_x_overlap"]
+NO_HELMET_MAX_BODY_FRACTION: float    = _cfg["bbox"]["no_helmet_max_body_fraction"]
 
 # ── Frame geometry ────────────────────────────────────────────────────────────
 ELEVATION_ZONE_RATIO: float           = _cfg["frame"]["elevation_zone_ratio"]

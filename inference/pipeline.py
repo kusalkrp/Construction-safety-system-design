@@ -143,6 +143,16 @@ class ConstructionSafetyPipeline:
                     confidence=conf,
                     x1=x1, y1=y1, x2=x2, y2=y2,
                 ))
+
+        # Log raw detections at DEBUG level — run with LOG_LEVEL=DEBUG to diagnose FPs
+        if logger.isEnabledFor(logging.DEBUG):
+            summary = ", ".join(f"{d.class_name}:{d.confidence:.2f}" for d in detections)
+            logger.debug("Raw YOLO detections: [%s]", summary or "none")
+        else:
+            from collections import Counter
+            counts = Counter(d.class_name for d in detections)
+            logger.info("Detections: %s", dict(counts))
+
         return detections
 
     def _format_report(self, site_report: SiteReport, score: ScoreResult) -> str:

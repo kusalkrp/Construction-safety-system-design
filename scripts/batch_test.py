@@ -2,11 +2,15 @@
 import sys
 sys.path.insert(0, ".")
 
+import os
 from pathlib import Path
 import cv2
+from dotenv import load_dotenv
 from inference.pipeline import ConstructionSafetyPipeline
 
-pipeline = ConstructionSafetyPipeline(weights_path="runs/train4/weights/best.pt", conf_threshold=0.30)
+load_dotenv()
+weights_path = os.getenv("MODEL_WEIGHTS_PATH", "runs/train4/weights/best.pt")
+pipeline = ConstructionSafetyPipeline(weights_path=weights_path, conf_threshold=0.30)
 test_dir = Path("dataset/merged/images/test")
 images = list(test_dir.glob("*.jpg"))[:100]
 

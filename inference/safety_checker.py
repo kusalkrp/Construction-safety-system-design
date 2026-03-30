@@ -29,8 +29,11 @@ from inference.constants import (
     FAR_FIELD_BBOX_THRESHOLD_PX,
     HIGH_CONFIDENCE_THRESHOLD,
     MEDIUM_CONFIDENCE_THRESHOLD,
+    NO_HELMET_MAX_BODY_FRACTION,
     PARTIAL_COMPLIANCE_CONF_HIGH,
     PARTIAL_COMPLIANCE_CONF_LOW,
+    PERSON_CROP_HEAD_EXPAND,
+    PPE_ABOVE_PERSON_X_OVERLAP,
     PPE_PERSON_OVERLAP_IOU,
     RULE_CONFIDENCE_BBOX_NORMALISE,
     VIOLATION_CONF_MIN,
@@ -88,6 +91,7 @@ class ViolationReport:
     timestamp: float = field(default_factory=time.time)
     is_visitor: bool = False
     is_site_alert: bool = False
+    violation_bbox: tuple[int, int, int, int] | None = None  # PPE detection box (for annotator)
 
 
 @dataclass
@@ -120,6 +124,52 @@ def compute_iou(box_a: tuple[int, int, int, int], box_b: tuple[int, int, int, in
     union_area = area_a + area_b - inter_area
 
     return inter_area / union_area if union_area > 0 else 0.0
+
+
+def expand_crop_for_ppe(
+    bbox: tuple[int, int, int, int],
+    frame_height: int,
+    frame_width: int,
+) -> tuple[int, int, int, int]:
+    """
+    Expand a person bounding box upward by PERSON_CROP_HEAD_EXPAND × box height.
+
+    When the person detector anchors on the torso, the head region sits above y1.
+    Expanding upward before PPE IoU matching ensures a helmet bbox above the torso
+    is still associated with the correct worker.
+
+    The original bbox is kept for ViolationReport annotation — this expanded box
+    is only used for PPE overlap search.
+    """
+    x1, y1, x2, y2 = bbox
+    box_height = y2 - y1
+    y1_expanded = max(0, y1 - int(box_height * PERSON_CROP_HEAD_EXPAND))
+    return x1, y1_expanded, x2, y2
+
+
+def is_above_person(
+    ppe_bbox: tuple[int, int, int, int],
+    person_bbox: tuple[int, int, int, int],
+) -> bool:
+    """
+    Return True when a PPE box sits directly above a person box with sufficient
+    horizontal overlap — catches helmets that the IoU check misses entirely
+    because the person detector anchored too low (chin/torso level).
+
+    Conditions:
+      - PPE box bottom (y2) is at or above the person box top (y1)
+      - Horizontal overlap between the two boxes >= PPE_ABOVE_PERSON_X_OVERLAP
+        of the PPE box width (30% default)
+    """
+    px1, py1, px2, _ = person_bbox
+    hx1, _, hx2, hy2 = ppe_bbox
+
+    if hy2 > py1:           # PPE bottom below person top — not above
+        return False
+
+    overlap_x = max(0, min(hx2, px2) - max(hx1, px1))
+    ppe_width  = max(1, hx2 - hx1)
+    return (overlap_x / ppe_width) >= PPE_ABOVE_PERSON_X_OVERLAP
 
 
 def compute_rule_confidence(
@@ -203,10 +253,71 @@ class SafetyChecker:
         # This handles the common case where the person class is not detected but PPE
         # violation classes are clearly visible.
         if not person_detections:
+            helmet_on_dets = [d for d in ppe_detections if d.class_name == "helmet_on"]
+            vest_on_dets   = [d for d in ppe_detections if d.class_name == "vest_on"]
+
+            def _spatially_suppressed(det: Detection, safe_dets: list[Detection]) -> bool:
+                """
+                Return True when a safe-class box (helmet_on / vest_on) is associated
+                with the violation box. Three cases:
+
+                  1. IoU overlap + safe wins on confidence — same region, conflicting labels
+                  2. Above-adjacent (any confidence) — helmet_on directly above a mislocalized
+                     no_helmet box. Spatial evidence overrides confidence: if a helmet box
+                     exists in the head region above the body, the helmet IS there regardless
+                     of which box scored higher.
+                  3. Anatomical impossibility — no_vest center in the head zone (top 25% of
+                     frame), or no_helmet center in the lower body zone (bottom 40% of frame).
+                     These are pure mislocalizations with no valid anatomical interpretation.
+                """
+                det_bbox = (det.x1, det.y1, det.x2, det.y2)
+                det_center_y = (det.y1 + det.y2) / 2
+
+                # Case 3 — anatomical position filter (no safe_det needed)
+                if det.class_name == "no_vest" and det_center_y < self.frame_height * 0.25:
+                    logger.debug(
+                        "Fallback suppressed no_vest — center y=%.0f is in head zone "
+                        "(top 25%% of %dpx frame)", det_center_y, self.frame_height,
+                    )
+                    return True
+                if det.class_name == "no_helmet" and det_center_y > self.frame_height * 0.60:
+                    logger.debug(
+                        "Fallback suppressed no_helmet — center y=%.0f is in lower body zone "
+                        "(below 60%% of %dpx frame)", det_center_y, self.frame_height,
+                    )
+                    return True
+
+                for safe in safe_dets:
+                    safe_bbox = (safe.x1, safe.y1, safe.x2, safe.y2)
+                    iou_match = compute_iou(det_bbox, safe_bbox) > PPE_PERSON_OVERLAP_IOU
+
+                    # Case 1 — IoU overlap, safe outscores violation
+                    if iou_match and safe.confidence > det.confidence:
+                        logger.debug(
+                            "Fallback suppressed %s (conf %.2f) — overlapping %s (conf %.2f)",
+                            det.class_name, det.confidence, safe.class_name, safe.confidence,
+                        )
+                        return True
+
+                    # Case 2 — above-adjacent, confidence irrelevant
+                    if is_above_person(safe_bbox, det_bbox):
+                        logger.debug(
+                            "Fallback suppressed %s (conf %.2f) — %s (conf %.2f) is "
+                            "directly above (spatial evidence overrides confidence)",
+                            det.class_name, det.confidence, safe.class_name, safe.confidence,
+                        )
+                        return True
+
+                return False
+
             violation_dets = [
                 d for d in ppe_detections
                 if d.class_name in ("no_helmet", "no_vest")
                 and d.confidence >= VIOLATION_CONF_MIN
+                and not _spatially_suppressed(
+                    d,
+                    helmet_on_dets if d.class_name == "no_helmet" else vest_on_dets,
+                )
             ]
             for worker_id, det in enumerate(violation_dets):
                 worker_reports.append(
@@ -276,10 +387,18 @@ class SafetyChecker:
                 is_visitor=True,
             )
 
-        # Find PPE detections overlapping this worker
+        # Find PPE detections overlapping this worker.
+        # Two association paths:
+        #   1. IoU with expanded bbox — person detector often anchors on the torso;
+        #      expanding upward 60% of box height captures most head regions.
+        #   2. is_above_person — catches helmets that sit entirely above the expanded
+        #      boundary (close-up images where the box starts at chin level).
+        ppe_search_bbox = expand_crop_for_ppe(person_bbox, self.frame_height, self.frame_width)
+        ppe_det_bbox = lambda d: (d.x1, d.y1, d.x2, d.y2)
         overlapping_ppe = [
             d for d in ppe_detections
-            if compute_iou(person_bbox, (d.x1, d.y1, d.x2, d.y2)) > PPE_PERSON_OVERLAP_IOU
+            if compute_iou(ppe_search_bbox, ppe_det_bbox(d)) > PPE_PERSON_OVERLAP_IOU
+            or is_above_person(ppe_det_bbox(d), person_bbox)
         ]
 
         ppe_class_names = {d.class_name for d in overlapping_ppe}
@@ -311,7 +430,34 @@ class SafetyChecker:
         # ── Rule 1 — No helmet ────────────────────────────────────────────────
         if "no_helmet" in ppe_class_names:
             no_helmet_det = ppe_by_class["no_helmet"]
-            if no_helmet_det.confidence >= VIOLATION_CONF_MIN:
+            helmet_on_det = ppe_by_class.get("helmet_on")
+
+            # Anatomical position check: no_helmet box center must be in the upper
+            # NO_HELMET_MAX_BODY_FRACTION of the person bbox. A no_helmet detection
+            # whose center sits in the torso/vest region is a mislocalized YOLO box
+            # (possibly the model confusing vest texture with a head region).
+            # For above-person detections (is_above_person path), person.y1 is the
+            # reference — anything above that is always valid.
+            no_helmet_center_y = (no_helmet_det.y1 + no_helmet_det.y2) / 2
+            person_head_boundary = person.y1 + person.height * NO_HELMET_MAX_BODY_FRACTION
+            no_helmet_in_head_region = (
+                no_helmet_center_y <= person_head_boundary   # within person box, upper half
+                or no_helmet_det.y2 <= person.y1             # fully above person box
+            )
+
+            if not no_helmet_in_head_region:
+                logger.debug(
+                    "Worker #%d: no_helmet box center y=%.0f is below head boundary y=%.0f — "
+                    "mislocalized detection rejected",
+                    worker_id, no_helmet_center_y, person_head_boundary,
+                )
+            # Conflict suppression: if helmet_on is detected with higher confidence
+            # than no_helmet on the same worker, the model is contradicting itself.
+            # Downgrade to partial_compliance (WARNING) rather than firing CRITICAL.
+            elif (
+                no_helmet_det.confidence >= VIOLATION_CONF_MIN
+                and not (helmet_on_det and helmet_on_det.confidence > no_helmet_det.confidence)
+            ):
                 violations.append("no_helmet")
                 is_elevated = person.y1 < self.frame_height * (1 - ELEVATION_ZONE_RATIO)
                 current_severity = "CRITICAL-ELEVATED" if is_elevated else "CRITICAL"
@@ -331,11 +477,34 @@ class SafetyChecker:
                     if is_elevated else
                     "Supervisor notification required. Worker must wear helmet in active zone."
                 )
+            elif no_helmet_det.confidence >= VIOLATION_CONF_MIN and helmet_on_det:
+                # Conflicting signals — helmet_on outscores no_helmet — flag for review
+                violations.append("partial_compliance")
+                if severity == "COMPLIANT":
+                    severity = "WARNING"
+                human_parts.append(
+                    f"Conflicting helmet signals: helmet_on ({helmet_on_det.confidence:.2f}) "
+                    f"vs no_helmet ({no_helmet_det.confidence:.2f}) — helmet status uncertain."
+                )
+                action_parts.append("CONFLICTING_PPE_SIGNAL — add to human review queue.")
 
         # ── Rule 2 — No vest (context-aware) ─────────────────────────────────
         if "no_vest" in ppe_class_names:
             no_vest_det = ppe_by_class["no_vest"]
-            if no_vest_det.confidence >= VIOLATION_CONF_MIN:
+            vest_on_det = ppe_by_class.get("vest_on")
+            # Conflict suppression: vest_on higher confidence than no_vest → review queue
+            if no_vest_det.confidence >= VIOLATION_CONF_MIN and (
+                vest_on_det and vest_on_det.confidence > no_vest_det.confidence
+            ):
+                violations.append("partial_compliance")
+                if severity == "COMPLIANT":
+                    severity = "WARNING"
+                human_parts.append(
+                    f"Conflicting vest signals: vest_on ({vest_on_det.confidence:.2f}) "
+                    f"vs no_vest ({no_vest_det.confidence:.2f}) — vest status uncertain."
+                )
+                action_parts.append("CONFLICTING_PPE_SIGNAL — add to human review queue.")
+            elif no_vest_det.confidence >= VIOLATION_CONF_MIN:
                 violations.append("no_vest")
                 vest_severity = "HIGH" if scene_context == "outdoor" else "WARNING"
                 if severity not in ("CRITICAL-ELEVATED", "CRITICAL"):
@@ -384,6 +553,18 @@ class SafetyChecker:
             hr = f"[COMPLIANT] {worker_label} — all PPE requirements met."
             action = "No action required."
 
+        # Capture the PPE violation box for the annotator to draw
+        primary_violation_det = (
+            ppe_by_class.get("no_helmet") if "no_helmet" in violations
+            else ppe_by_class.get("no_vest") if "no_vest" in violations
+            else None
+        )
+        v_bbox = (
+            (primary_violation_det.x1, primary_violation_det.y1,
+             primary_violation_det.x2, primary_violation_det.y2)
+            if primary_violation_det else None
+        )
+
         return ViolationReport(
             worker_id=worker_id,
             bbox=person_bbox,
@@ -395,6 +576,7 @@ class SafetyChecker:
             scene_context=scene_context,
             human_readable=hr,
             recommended_action=action,
+            violation_bbox=v_bbox,
         )
 
     def _report_from_violation_det(

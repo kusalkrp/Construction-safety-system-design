@@ -18,6 +18,12 @@ bbox:
   rule_confidence_bbox_normalise: 80   # bbox_size_factor = min(1.0, height / this)
   crowd_iou_threshold: 0.50            # IoU > this between person boxes → crowd ambiguous
   ppe_person_overlap_iou: 0.10         # IoU > this required to associate PPE box with worker
+  person_crop_head_expand: 0.60        # expand person bbox upward by X × height for PPE overlap matching
+                                       # 0.60 needed for close-up images where person detector anchors at chin level
+  ppe_above_person_x_overlap: 0.30     # min horizontal overlap fraction to associate a helmet box sitting above
+                                       # the person box — catches helmets that IoU misses entirely
+  no_helmet_max_body_fraction: 0.50    # no_helmet box center must be in the top X% of the person bbox
+                                       # rejects mislocalized detections at vest/torso level (anatomically impossible)
 
 # ── Frame geometry ────────────────────────────────────────────────────────────
 frame:
