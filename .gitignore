@@ -208,9 +208,6 @@ __marimo__/
 .claude/
 
 # Project — model weights & training runs
-runs/
-*.pt
-*.onnx
 
 # Project — dataset (large binary files)
 dataset/images/
@@ -231,3 +228,7 @@ implementation_plan.md
 Docs/
 DATASET_EXTENSION_GUIDE.md
 dataset/
+training/notebooks/yolov8n.pt
+training/notebooks/yolov8s.pt
+training/notebooks/yolov8m.pt
+training/notebooks/yolo11n.pt
