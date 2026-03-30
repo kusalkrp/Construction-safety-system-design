@@ -129,6 +129,92 @@ def test_rule5_no_ppe_detected_warning():
     assert report.severity == "WARNING"
 
 
+def test_rule3_does_not_double_fire_with_rule1():
+    """no_helmet at conf >= VIOLATION_CONF_MIN must not also add partial_compliance."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person = make_person(y1=300, y2=580)  # lower half (y1>=256) — not elevated
+    no_helmet = make_ppe("no_helmet", conf=0.50)
+    report = checker.analyse([person, no_helmet]).worker_reports[0]
+    assert "no_helmet" in report.violations
+    assert "partial_compliance" not in report.violations
+    assert report.severity == "CRITICAL"
+
+
+def test_rule3_does_not_fire_for_bonus_class():
+    """mask_on at borderline confidence must not generate partial_compliance for a fully compliant worker."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person = make_person()
+    helmet_on = make_ppe("helmet_on", conf=0.85)
+    vest_on   = make_ppe("vest_on",   x1=110, y1=200, x2=190, y2=350, conf=0.85)
+    mask_on   = make_ppe("mask_on",   conf=0.45)
+    report = checker.analyse([person, helmet_on, vest_on, mask_on]).worker_reports[0]
+    assert report.violations == []
+    assert report.severity == "COMPLIANT"
+
+
+def test_rule3_deduplicated_for_multiple_borderline_detections():
+    """Two borderline PPE detections must produce only one partial_compliance entry."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person   = make_person()
+    helmet_on = make_ppe("helmet_on", conf=0.50)
+    vest_on   = make_ppe("vest_on",   x1=110, y1=200, x2=190, y2=350, conf=0.50)
+    report = checker.analyse([person, helmet_on, vest_on]).worker_reports[0]
+    assert report.violations.count("partial_compliance") == 1
+
+
+def test_fallback_conflict_generates_partial_compliance():
+    """Fallback path: helmet_on outscoring no_helmet via IoU must produce partial_compliance, not COMPLIANT."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    no_helmet = Detection("no_helmet", 0.55, 110, 50, 190, 130)
+    helmet_on = Detection("helmet_on", 0.70, 110, 50, 190, 130)
+    sr = checker.analyse([no_helmet, helmet_on])
+    assert len(sr.worker_reports) == 1
+    assert sr.worker_reports[0].violations == ["partial_compliance"]
+    assert sr.worker_reports[0].severity == "WARNING"
+
+
+def test_ppe_by_class_uses_highest_confidence():
+    """When two no_helmet boxes overlap a worker, the strongest one must drive Rule 1."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person    = make_person()
+    nh_strong = Detection("no_helmet", 0.75, 110, 110, 190, 170)
+    nh_weak   = Detection("no_helmet", 0.35, 112, 112, 188, 168)
+    report = checker.analyse([person, nh_strong, nh_weak]).worker_reports[0]
+    assert "no_helmet" in report.violations
+    assert "CRITICAL" in report.severity
+
+
+def test_rule5_mask_only_still_flags_ppe_gap():
+    """Only mask_on overlapping a worker must not block Rule 5 — helmet+vest still unverified."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person  = make_person()
+    mask_on = make_ppe("mask_on", conf=0.45)
+    report = checker.analyse([person, mask_on]).worker_reports[0]
+    assert "ppe_gap" in report.violations
+
+
+def test_rule5_helmet_only_no_vest_class_is_ppe_gap():
+    """Worker with helmet_on but no vest-class detected must not score COMPLIANT."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person = make_person(x1=100, y1=100, x2=200, y2=400)
+    helmet_on = make_ppe("helmet_on", x1=110, y1=110, x2=190, y2=160, conf=0.85)
+    # No vest_on or no_vest — vest state is unknown
+    report = checker.analyse([person, helmet_on]).worker_reports[0]
+    assert "ppe_gap" in report.violations
+    assert report.severity == "WARNING"
+
+
+def test_rule5_vest_only_no_helmet_class_is_ppe_gap():
+    """Worker with vest_on but no helmet-class detected must not score COMPLIANT."""
+    checker = SafetyChecker(frame_width=640, frame_height=640)
+    person = make_person(x1=100, y1=100, x2=200, y2=400)
+    vest_on = make_ppe("vest_on", x1=110, y1=200, x2=190, y2=350, conf=0.85)
+    # No helmet_on or no_helmet — helmet state is unknown
+    report = checker.analyse([person, vest_on]).worker_reports[0]
+    assert "ppe_gap" in report.violations
+    assert report.severity == "WARNING"
+
+
 # ── Rule 6 — Site-level crowd ─────────────────────────────────────────────────
 
 def test_rule6_triggers_with_majority_violations():
