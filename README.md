@@ -180,6 +180,36 @@ The two safety-critical classes (no_helmet, no_vest) are the most important to e
 
 ---
 
+## Honest Assessment — Where It Works and Where It Doesn't
+
+### Where the model performs well
+
+**Vest detection is reliable.** `vest_on` and `no_vest` both score above 93% mAP@50. Hi-vis vests are large, brightly coloured, and occupy a consistent torso region — the model has learned this robustly across outdoor scenes, scaffolding imagery, and augmented lighting conditions. In normal daylight construction footage, vest compliance is the most dependable signal the system produces.
+
+**Helmet-on detection is strong.** `helmet_on` at 95.6% mAP@50 means the model rarely misses a worker who is wearing a helmet. False negatives on the safe class are low, which matters: the system won't incorrectly flag compliant workers at high volume.
+
+**Crowd-level and site-level scoring holds up.** When multiple workers are present, the compliance score and crowd escalation (Rule 6) aggregate individual detections sensibly. The temporal decay and sliding window logic work as designed for video input — violations that clear up stop affecting the score within the decay window.
+
+**The suppression logic catches the model's own mislocalizations.** The anatomical position filter and above-adjacent suppression were added specifically because the model produces mislocalized `no_helmet` boxes at torso level in close-up shots. These filters prevent those from generating false CRITICAL alerts, and in testing they eliminated the most common false positive category without hurting recall.
+
+---
+
+### Where the model struggles
+
+**`no_helmet` detection is the weakest safety-critical class.** At 70.0% recall, roughly 3 in 10 real no-helmet violations are missed. This is the class that matters most — a missed no-helmet is a missed head injury risk. The root causes are structural: the class has the fewest training annotations (1,835 vs. 7,095 for vest_on), and the model confuses close-up hair and dark backgrounds with a worn helmet. Fine-tuning improved it from ~900 to 1,835 annotations but the shortfall from the 2,000 target remains.
+
+**Person detection fails on close-up, cropped frames.** When a worker fills most of the frame, the model frequently misses the `person` class entirely — because the training data is dominated by full-body and mid-field shots. The fallback path (derive violation reports from PPE boxes directly) handles this at runtime, but it is a workaround, not a fix. It means the system cannot produce worker IDs or apply Rules 4–6 when the person anchor is missing.
+
+**Night, low-light, and indoor fluorescent scenes are unreliable.** No real night-time imagery was available for training. Augmentation simulates some lighting variation, but detection confidence drops significantly below threshold in genuinely dark frames — the system silently falls back to the review queue rather than generating alerts. A site using overhead CCTV in an unlit area at night should not rely on this model without IR cameras.
+
+**`mask_on` is too sparse to trust in isolation.** At 58.5% recall it is only useful as a supporting signal. It is not enforced as a safety rule and should not be.
+
+**Far-field workers are an acknowledged blind spot.** Workers whose bounding box is under 40px tall cannot be assessed for PPE state — the system flags them UNVERIFIABLE. In wide-angle CCTV footage covering a large site, a significant fraction of workers may fall into this category. This is not a model failure but a camera placement and resolution constraint.
+
+**The system has not been tested on regional PPE variants.** All training data is from global public datasets. Locally specific PPE (different helmet colours, alternative vest styles, partial-coverage vests) may produce lower confidence scores and more partial-compliance flags than expected.
+
+---
+
 ## Known Failure Modes
 
 | Failure | What happens | Mitigation applied | Production fix |
@@ -199,13 +229,21 @@ The two safety-critical classes (no_helmet, no_vest) are the most important to e
 ### Prerequisites
 
 - Python 3.10+
-- NVIDIA GPU (RTX 3060 or better recommended for training)
-- Docker (for API serving)
+- [Conda](https://docs.conda.io/en/latest/miniconda.html) (recommended — project uses `ai-env`)
+- NVIDIA GPU (RTX 3060 or better recommended for training; CPU works for inference only)
+- Docker (for API serving only — not required for local inference or demo)
 
-### Step 1 — Install dependencies
+### Step 1 — Create conda environment and install dependencies
 
 ```bash
+conda create -n ai-env python=3.10 -y
+conda activate ai-env
 cd construction-safety-system-design
+pip install -r requirements.txt
+```
+
+Or with an existing Python 3.10+ environment:
+```bash
 pip install -r requirements.txt
 ```
 
@@ -263,8 +301,22 @@ jupyter notebook training/notebooks/training.ipynb
 jupyter notebook "training/notebooks/Retrain with finetuning.ipynb"
 ```
 
-### Step 6 — Run the Gradio demo
+### Step 6 — Run inference
 
+**Single image (CLI):**
+```bash
+conda activate ai-env
+python -m inference.pipeline --source path/to/image.jpg
+```
+
+Output: annotated image written to `output/` + printed violation report + compliance score.
+
+To use a specific weights file:
+```bash
+python -m inference.pipeline --source path/to/image.jpg --weights runs/train4/weights/best.pt
+```
+
+**Gradio demo (browser UI):**
 ```bash
 python demo.py
 ```
@@ -280,6 +332,78 @@ Open `http://localhost:7860`. Upload a construction site image to get:
 docker-compose -f serving/docker-compose.yml up
 curl -X POST http://localhost:8000/analyse -F "file=@path/to/image.jpg" | python -m json.tool
 ```
+
+---
+
+## Running Inference in Google Colab
+
+Use this when you have no local GPU or want to demo the system without a full local install.
+
+### Option A — Run inference on uploaded images
+
+```python
+# Cell 1 — install dependencies
+!pip install ultralytics opencv-python-headless gradio pydantic-settings slowapi python-dotenv
+
+# Cell 2 — clone the repo (or upload your own copy)
+!git clone https://github.com/YOUR_USERNAME/construction-safety-system-design.git
+%cd construction-safety-system-design
+
+# Cell 3 — upload weights file
+from google.colab import files
+uploaded = files.upload()   # upload runs/train53/weights/best.pt
+
+import os, shutil
+os.makedirs("runs/train53/weights", exist_ok=True)
+shutil.move(list(uploaded.keys())[0], "runs/train53/weights/best.pt")
+
+# Cell 4 — set environment variables (no .env file needed in Colab)
+os.environ["MODEL_WEIGHTS_PATH"] = "runs/train53/weights/best.pt"
+os.environ["RULES_CONFIG_PATH"] = "rules.yaml"
+os.environ["LOG_LEVEL"] = "INFO"
+
+# Cell 5 — run inference on an uploaded image
+uploaded_img = files.upload()   # upload any construction site image
+img_path = list(uploaded_img.keys())[0]
+
+from inference.pipeline import ConstructionSafetyPipeline
+from PIL import Image
+import numpy as np
+
+pipeline = ConstructionSafetyPipeline(weights_path="runs/train53/weights/best.pt")
+frame = np.array(Image.open(img_path).convert("RGB"))
+result = pipeline.analyse(frame)
+
+print(result.formatted_report)
+
+# Cell 6 — display annotated output
+from IPython.display import display
+import PIL.Image
+display(PIL.Image.fromarray(result.annotated_frame))
+```
+
+### Option B — Run the Gradio demo in Colab
+
+```python
+# After completing Cells 1–4 above:
+
+# Cell 5 — launch demo with public URL
+import subprocess
+proc = subprocess.Popen(["python", "demo.py"])
+
+# Gradio will print a public share URL — open it in your browser
+# e.g. https://abc123.gradio.live
+```
+
+### Option C — Batch test on the test set
+
+```python
+# After completing Cells 1–4 above, run the batch test script:
+!python scripts/batch_test.py
+```
+
+> **GPU note:** Colab's free T4 GPU is sufficient for inference. For training, use Colab Pro
+> or run locally on an RTX 3060+. Training notebooks are in `training/notebooks/`.
 
 ---
 

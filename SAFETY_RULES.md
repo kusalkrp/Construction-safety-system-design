@@ -44,6 +44,14 @@ indicating the worker is likely at height (scaffolding, elevated platform).
 Head injuries are the leading cause of construction fatalities globally.
 A worker at height without head protection represents the highest-risk PPE failure.
 
+**Example — Rule 1 CRITICAL (no helmet, site floor):**
+
+![Rule 1 — no helmet CRITICAL](output/rule%201%20no%20helmet.png)
+
+**Example — Rule 1 CRITICAL-ELEVATED (no helmet + no vest, elevated position):**
+
+![Rule 1 — elevated, no helmet and no vest](output/rule%201%20with%20no%20helmet%20no%20vest.jpg)
+
 ---
 
 ## Rule 2 — No High-Visibility Vest (Context-Aware)
@@ -76,6 +84,10 @@ and sufficiently accurate for risk modulation purposes.
 Hi-vis vests protect workers from vehicle and machinery strike.
 Risk is context-dependent — outdoor means vehicle exposure; indoor means lower but non-zero risk.
 
+**Example — Rule 2 (multiple workers, no vest):**
+
+![Rule 2 — no vest violations](output/rule2_no_vest.jpg)
+
 ---
 
 ## Rule 3 — Partial Compliance (Low-Confidence Ambiguity)
@@ -101,6 +113,10 @@ Also fires when **conflicting PPE signals** are detected on the same worker:
 **Rationale:**
 Partial compliance is a real safety risk but cannot be reliably confirmed by
 a detection model alone. The honest response is to flag uncertainty, not guess.
+
+**Example — Rule 3 (borderline confidence, review queue):**
+
+![Rule 3 — partial compliance WARNING](output/rule3_partial.jpg)
 
 ---
 
@@ -137,6 +153,10 @@ Human review recommended.`
 A false negative from the PPE detector silently passing as "compliant."
 The system flags the absence of evidence rather than treating it as evidence of compliance.
 
+**Example — Rule 5 (workers detected, PPE unassociated):**
+
+![Rule 5 — PPE gap WARNING](output/rule5_ppe_gap.jpg)
+
 ---
 
 ## Rule 6 — Site-Level Crowd Non-Compliance
@@ -159,6 +179,10 @@ one active violation (Rule 1 or Rule 2) with rule_confidence ≥ 0.60.
 
 **Crowd multiplier:**
 When Rule 6 triggers, the compliance score deduction is multiplied by 1.3.
+
+**Example — Rule 6 (site alert, systemic non-compliance):**
+
+![Rule 6 — site alert CRITICAL](output/rule%206%20site%20alert.png)
 
 ---
 

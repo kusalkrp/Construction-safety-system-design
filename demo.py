@@ -19,7 +19,7 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
-WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "runs/train/weights/best.pt")
+WEIGHTS_PATH = os.getenv("MODEL_WEIGHTS_PATH", "runs/traind53/weights/best.pt")
 _pipeline = None
 
 

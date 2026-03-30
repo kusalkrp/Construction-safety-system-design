@@ -256,73 +256,68 @@ class SafetyChecker:
             helmet_on_dets = [d for d in ppe_detections if d.class_name == "helmet_on"]
             vest_on_dets   = [d for d in ppe_detections if d.class_name == "vest_on"]
 
-            def _spatially_suppressed(det: Detection, safe_dets: list[Detection]) -> bool:
+            def _suppression_reason(det: Detection, safe_dets: list[Detection]) -> str | None:
                 """
-                Return True when a safe-class box (helmet_on / vest_on) is associated
-                with the violation box. Three cases:
-
-                  1. IoU overlap + safe wins on confidence — same region, conflicting labels
-                  2. Above-adjacent (any confidence) — helmet_on directly above a mislocalized
-                     no_helmet box. Spatial evidence overrides confidence: if a helmet box
-                     exists in the head region above the body, the helmet IS there regardless
-                     of which box scored higher.
-                  3. Anatomical impossibility — no_vest center in the head zone (top 25% of
-                     frame), or no_helmet center in the lower body zone (bottom 40% of frame).
-                     These are pure mislocalizations with no valid anatomical interpretation.
+                Returns:
+                  None          — not suppressed; generate violation report
+                  "anatomical"  — box in physically impossible location; silently discard
+                  "conflict"    — safe class provides contradicting evidence; generate
+                                  partial_compliance WARNING instead of violation
                 """
                 det_bbox = (det.x1, det.y1, det.x2, det.y2)
                 det_center_y = (det.y1 + det.y2) / 2
 
-                # Case 3 — anatomical position filter (no safe_det needed)
+                # Anatomical impossibility — no safe_det needed
                 if det.class_name == "no_vest" and det_center_y < self.frame_height * 0.25:
                     logger.debug(
                         "Fallback suppressed no_vest — center y=%.0f is in head zone "
                         "(top 25%% of %dpx frame)", det_center_y, self.frame_height,
                     )
-                    return True
+                    return "anatomical"
                 if det.class_name == "no_helmet" and det_center_y > self.frame_height * 0.60:
                     logger.debug(
                         "Fallback suppressed no_helmet — center y=%.0f is in lower body zone "
                         "(below 60%% of %dpx frame)", det_center_y, self.frame_height,
                     )
-                    return True
+                    return "anatomical"
 
                 for safe in safe_dets:
                     safe_bbox = (safe.x1, safe.y1, safe.x2, safe.y2)
                     iou_match = compute_iou(det_bbox, safe_bbox) > PPE_PERSON_OVERLAP_IOU
 
-                    # Case 1 — IoU overlap, safe outscores violation
                     if iou_match and safe.confidence > det.confidence:
                         logger.debug(
-                            "Fallback suppressed %s (conf %.2f) — overlapping %s (conf %.2f)",
+                            "Fallback conflict: %s (conf %.2f) vs %s (conf %.2f) — "
+                            "safe class wins on IoU; generating partial_compliance",
                             det.class_name, det.confidence, safe.class_name, safe.confidence,
                         )
-                        return True
+                        return "conflict"
 
-                    # Case 2 — above-adjacent, confidence irrelevant
                     if is_above_person(safe_bbox, det_bbox):
                         logger.debug(
-                            "Fallback suppressed %s (conf %.2f) — %s (conf %.2f) is "
-                            "directly above (spatial evidence overrides confidence)",
-                            det.class_name, det.confidence, safe.class_name, safe.confidence,
+                            "Fallback conflict: %s directly above %s — "
+                            "spatial evidence overrides confidence; generating partial_compliance",
+                            safe.class_name, det.class_name,
                         )
-                        return True
+                        return "conflict"
 
-                return False
+                return None
 
-            violation_dets = [
+            worker_id = 0
+            for det in [
                 d for d in ppe_detections
                 if d.class_name in ("no_helmet", "no_vest")
                 and d.confidence >= VIOLATION_CONF_MIN
-                and not _spatially_suppressed(
-                    d,
-                    helmet_on_dets if d.class_name == "no_helmet" else vest_on_dets,
-                )
-            ]
-            for worker_id, det in enumerate(violation_dets):
-                worker_reports.append(
-                    self._report_from_violation_det(worker_id, det, scene_context)
-                )
+            ]:
+                safe_dets = helmet_on_dets if det.class_name == "no_helmet" else vest_on_dets
+                reason = _suppression_reason(det, safe_dets)
+                if reason is None:
+                    worker_reports.append(self._report_from_violation_det(worker_id, det, scene_context))
+                    worker_id += 1
+                elif reason == "conflict":
+                    worker_reports.append(self._report_conflict_fallback(worker_id, det, scene_context))
+                    worker_id += 1
+                # "anatomical": silently discard
 
         site_alert = self._check_site_level(worker_reports)
 
@@ -402,7 +397,12 @@ class SafetyChecker:
         ]
 
         ppe_class_names = {d.class_name for d in overlapping_ppe}
-        ppe_by_class: dict[str, Detection] = {d.class_name: d for d in overlapping_ppe}
+        # Fix: keep highest-confidence detection per class (last-wins dict would silently
+        # replace a strong no_helmet with a weak one if iteration order puts the weak one last)
+        ppe_by_class: dict[str, Detection] = {}
+        for _d in overlapping_ppe:
+            if _d.class_name not in ppe_by_class or _d.confidence > ppe_by_class[_d.class_name].confidence:
+                ppe_by_class[_d.class_name] = _d
 
         violations: list[str] = []
         severity = "COMPLIANT"
@@ -417,15 +417,25 @@ class SafetyChecker:
         )
 
         # ── Rule 3 — Partial compliance ───────────────────────────────────────
+        # Only fires for safety-critical required PPE (not bonus classes like mask_on).
+        # Skips no_helmet/no_vest at conf >= VIOLATION_CONF_MIN — those are handled by
+        # Rules 1/2 which produce the correct severity. Deduplicated: one partial_compliance
+        # entry regardless of how many borderline detections are present.
+        _REQUIRED_PPE = {"helmet_on", "vest_on", "no_helmet", "no_vest"}
         for ppe_det in overlapping_ppe:
+            if ppe_det.class_name not in _REQUIRED_PPE:
+                continue
+            if ppe_det.class_name in ("no_helmet", "no_vest") and ppe_det.confidence >= VIOLATION_CONF_MIN:
+                continue  # will be handled by Rule 1/2 at correct severity
             if PARTIAL_COMPLIANCE_CONF_LOW <= ppe_det.confidence <= PARTIAL_COMPLIANCE_CONF_HIGH:
-                violations.append("partial_compliance")
-                severity = "WARNING"
+                if "partial_compliance" not in violations:
+                    violations.append("partial_compliance")
+                    severity = "WARNING"
+                    action_parts.append("PARTIAL_COMPLIANCE_SUSPECTED — add to human review queue.")
                 human_parts.append(
                     f"{ppe_det.class_name} detected with borderline confidence "
                     f"({ppe_det.confidence:.2f}) — possible partial wear or occlusion."
                 )
-                action_parts.append("PARTIAL_COMPLIANCE_SUSPECTED — add to human review queue.")
 
         # ── Rule 1 — No helmet ────────────────────────────────────────────────
         if "no_helmet" in ppe_class_names:
@@ -522,13 +532,35 @@ class SafetyChecker:
                 )
 
         # ── Rule 5 — Occlusion / PPE detection gap ────────────────────────────
-        if not overlapping_ppe and not violations:
+        # Fires when: (a) no PPE at all, (b) helmet detected but no vest-class,
+        # or (c) vest detected but no helmet-class. Each PPE item is assessed
+        # independently — presence of one does not confirm the other.
+        has_helmet_class = any(
+            d.class_name in ("helmet_on", "no_helmet") for d in overlapping_ppe
+        )
+        has_vest_class = any(
+            d.class_name in ("vest_on", "no_vest") for d in overlapping_ppe
+        )
+        if not violations and (
+            not overlapping_ppe
+            or not has_helmet_class
+            or not has_vest_class
+        ):
             violations.append("ppe_gap")
             if severity == "COMPLIANT":
                 severity = "WARNING"
-            human_parts.append(
-                "No PPE boxes overlap this worker — possible occlusion or detection gap."
-            )
+            if not overlapping_ppe:
+                human_parts.append(
+                    "No PPE boxes overlap this worker — possible occlusion or detection gap."
+                )
+            elif not has_helmet_class:
+                human_parts.append(
+                    "Vest detected but no helmet-class associated — helmet state unverifiable."
+                )
+            else:
+                human_parts.append(
+                    "Helmet detected but no vest-class associated — vest state unverifiable."
+                )
             action_parts.append(
                 "OCCLUDED_WORKER — PPE state unknown. Human review recommended before clearing."
             )
@@ -644,6 +676,48 @@ class SafetyChecker:
             scene_context=scene_context,
             human_readable=hr,
             recommended_action=action,
+        )
+
+    def _report_conflict_fallback(
+        self,
+        worker_id: int,
+        det: Detection,
+        scene_context: str,
+    ) -> ViolationReport:
+        """
+        Partial compliance report for the fallback path when a safe class (helmet_on/vest_on)
+        contradicts a violation detection via IoU or spatial evidence.
+        Previously this case returned nothing (score=100 COMPLIANT) — now surfaces as WARNING.
+        """
+        bbox = (det.x1, det.y1, det.x2, det.y2)
+        bbox_x_center = (det.x1 + det.x2) / 2.0
+        rule_conf = compute_rule_confidence(
+            detection_conf=det.confidence,
+            bbox_height=det.height,
+            bbox_x_center=bbox_x_center,
+            frame_width=self.frame_width,
+        )
+        confidence_tier = get_confidence_tier(rule_conf)
+        safe_class = "helmet_on" if det.class_name == "no_helmet" else "vest_on"
+        hr = (
+            f"[WARNING] Worker #{worker_id} — partial_compliance\n"
+            f"  Conflicting signals: {det.class_name} (conf {det.confidence:.2f}) detected "
+            f"but {safe_class} present in same region with higher confidence — PPE state uncertain.\n"
+            f"  Rule confidence: {confidence_tier} ({rule_conf:.2f})\n"
+            f"  Scene context: {scene_context} construction site\n"
+            f"  Note: person class not detected — report derived from PPE box directly."
+        )
+        return ViolationReport(
+            worker_id=worker_id,
+            bbox=bbox,
+            violations=["partial_compliance"],
+            detection_confidence=det.confidence,
+            rule_confidence=rule_conf,
+            confidence_tier=confidence_tier,
+            severity="WARNING",
+            scene_context=scene_context,
+            human_readable=hr,
+            recommended_action="CONFLICTING_PPE_SIGNAL — add to human review queue.",
         )
 
     def _check_site_level(
