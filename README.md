@@ -1,6 +1,6 @@
 # Construction Safety Monitor
 
-A two-stage YOLOv8 system that detects PPE compliance violations on construction sites in real time.
+A YOLOv8-based system that detects PPE compliance violations on construction sites in real time.
 It flags what it knows, admits what it doesn't, and escalates only when confidence warrants it —
 designed for trustworthiness over raw accuracy.
 
@@ -22,24 +22,33 @@ actually needs.
 Input Frame
     │
     ▼
-Stage 1: YOLOv8m — Person Detector  (COCO pretrained, fine-tuned)
-    │  outputs: person bounding boxes
+YOLOv8m — Single-pass full-frame detection
+    │  classes: helmet_on, no_helmet, vest_on, no_vest, person, mask_on
     ▼
-Stage 2: YOLOv8m — PPE Detector     (per-person crop)
-    │  classes: helmet_on, no_helmet, vest_on, no_vest, mask_on
-    ▼
-Stage 3: SafetyChecker              (Rules 1–6, rule_confidence)
+SafetyChecker              (Rules 1–6, rule_confidence, suppression logic)
     │  outputs: ViolationReport per worker
     ▼
-Stage 4: SiteScorer                 (0–100 compliance score)
+SiteScorer                 (0–100 compliance score + temporal decay)
     │  outputs: score + colour band
     ▼
-Output: annotated frame + JSON report + compliance score
+Annotator                  (solid box = person anchor, dashed box = PPE violation location)
+    │
+Output: annotated frame + structured report + compliance score
 ```
 
-**Why two-stage:** PPE classification on per-person crops is easier to train with limited data.
-Failure modes are isolated — person detection and PPE detection can be debugged independently.
-The compliance logic is transparent and independently testable (no YOLO calls inside `SafetyChecker`).
+**Single-pass design:** YOLO runs once on the full frame and returns all boxes (persons + all PPE
+classes simultaneously). `SafetyChecker` then associates PPE boxes to person boxes by IoU and
+geometry — it never calls YOLO. This isolates the compliance logic and makes it independently
+testable. The compliance rules, thresholds, and scoring formula are all independently unit-tested
+with 29 tests, none of which touch the model.
+
+**PPE association strategy:**
+- Expanded person bbox (60% upward) for IoU search — compensates for torso-anchored detections
+- `is_above_person` check — associates helmets sitting above the person box when IoU is near zero
+- Conflict suppression — when `helmet_on` and `no_helmet` overlap the same worker, the safe class
+  wins (spatial and confidence evidence both considered)
+- Anatomical position filter — `no_helmet` box in the lower body zone (below 60% frame height)
+  or `no_vest` box in the head zone (above 25% frame height) are rejected as mislocalizations
 
 ---
 
@@ -50,10 +59,10 @@ machine-readable in [`rules.yaml`](rules.yaml).
 
 | Rule | Trigger | Severity |
 |---|---|---|
-| 1 — No helmet | `no_helmet` conf ≥ 0.50, bbox ≥ 40px | CRITICAL |
-| 1 (elevated) | same + upper 40% of frame | CRITICAL-ELEVATED |
-| 2 — No vest (outdoor) | `no_vest` conf ≥ 0.50, outdoor scene | HIGH |
-| 2 — No vest (indoor) | `no_vest` conf ≥ 0.50, indoor scene | WARNING |
+| 1 — No helmet | `no_helmet` conf ≥ 0.40, bbox ≥ 40px | CRITICAL |
+| 1 (elevated) | same + upper 60% of frame | CRITICAL-ELEVATED |
+| 2 — No vest (outdoor) | `no_vest` conf ≥ 0.40, outdoor scene | HIGH |
+| 2 — No vest (indoor) | `no_vest` conf ≥ 0.40, indoor scene | WARNING |
 | 3 — Partial compliance | PPE conf 0.35–0.65 | WARNING → review queue |
 | 4 — Far-field worker | Person bbox height < 40px | UNVERIFIABLE |
 | 5 — Occlusion gap | Person detected, no PPE overlap | WARNING → review queue |
@@ -81,64 +90,105 @@ score = 100
 | 40–59 | AT RISK (orange) | Active intervention required |
 | 0–39 | CRITICAL (red) | Stop-work consideration |
 
+**`rule_confidence` formula** — composite signal used for tiering alerts:
+```
+rule_confidence = 0.60 × detection_conf
+               + 0.25 × min(1.0, bbox_height / 80)
+               + 0.15 × (1.0 − edge_proximity_ratio)
+```
+Tiers: HIGH ≥ 0.70 → immediate alert | MEDIUM ≥ 0.45 → review queue | LOW < 0.45 → logged only
+
 ---
 
 ## Dataset
 
-Four sources merged into one 6-class dataset:
+Seven sources merged into one 6-class dataset. Full documentation: [`docs/DATASET.md`](docs/DATASET.md).
 
-| Source | Images | Format | Key classes contributed |
-|---|---|---|---|
-| Roboflow Construction Site Safety (base) | ~3,000 | YOLO txt | All 6 classes |
-| Kaggle PPE Kit Detection | ~1,263 | YOLO txt | no_helmet, no_vest, helmet_on, vest_on |
-| Kaggle Safety Vests Detection | ~3,897 | Pascal VOC CSV → converted | vest_on, no_vest |
-| Roboflow Hard Hat Sample (scaffolding) | ~2,192 | YOLO txt | helmet_on, vest_on, person |
+| Source | Images | Key classes contributed |
+|---|---|---|
+| Roboflow Construction Site Safety (base) | 194 | All 6 classes — balanced baseline |
+| Kaggle PPE Kit Detection | 1,415 | no_helmet, no_vest, helmet_on, vest_on |
+| Kaggle Safety Vests Detection | 3,897 | vest_on, no_vest — dominant vest source |
+| Roboflow Scaffolding | 1,999 | helmet_on, vest_on, person — elevation scenes |
+| Roboflow Worker | 768 | person only — 2,279 person boxes (fixes weak person class) |
+| Roboflow No-Helmet | 212 | no_helmet — 384 boxes (closes class shortfall) |
+| Roboflow No-Vest | 351 | no_vest — additional violation coverage |
+| **Total raw** | **8,836** | |
 
 - **Class remapping:** each source remapped to 6-class schema (see `dataset/mappings/`)
-- **Violation ratio:** ~60% violation annotations intentionally — optimises for recall on safety-critical classes
-- **Split:** 75% train / 15% val / 10% test
-- **Offline augmentation:** shadow overlay, fog/haze, Gaussian blur, brightness/contrast, Gaussian noise, horizontal flip — train split only, factor ×2
-
-Full documentation: [`docs/DATASET.md`](docs/DATASET.md)
+- **Train/val/test split:** 73.9% / 15.0% / 10.0% (6,517 raw train + 13,477 augmented = 20,106 total train)
+- **Offline augmentation:** shadow overlay, fog/haze, Gaussian blur, brightness/contrast, Gaussian noise,
+  horizontal flip — factor ×2 on train split only
+- **Fine-tuning:** train5 (run as `train53`) fine-tuned from train4 weights using raw-only split
+  (`data_raw.yaml`, 6,517 images) with online augmentation — avoids 72-hour full-dataset training
 
 ---
 
 ## Training
 
-- **Model:** YOLOv8m pretrained on COCO 2017 — fine-tuned end-to-end
-- **Hardware:** NVIDIA RTX 3060 6 GB VRAM
-- **Config:** `imgsz=640`, `batch=8`, `epochs=50`, `AdamW`, `lr0=0.001`, `patience=15`
-- **Notebook:** [`training/notebooks/training.ipynb`](training/notebooks/training.ipynb) — run all cells top-to-bottom
+Two training runs. The fine-tuned model (`train53`) is the active production model.
+
+| Run | Weights | Config | Purpose |
+|---|---|---|---|
+| train4 | `runs/train4/weights/best.pt` | YOLOv8m, epoch 50, lr0=0.001, batch=8 | Initial full training |
+| train53 | `runs/train53/weights/best.pt` | Fine-tune from train4, epoch 20, lr0=0.0001, batch=16 | Person class fix + no_helmet boost |
+
+- **Model:** YOLOv8m pretrained on COCO 2017
+- **Hardware:** NVIDIA RTX 3060 6 GB VRAM (local training)
+- **Config:** `imgsz=640`, `AdamW`, `patience=8`, `augment=True`
+- **Notebook (train4):** [`training/notebooks/training.ipynb`](training/notebooks/training.ipynb)
+- **Notebook (train53):** [`training/notebooks/Retrain with finetuning.ipynb`](training/notebooks/Retrain%20with%20finetuning.ipynb)
 
 ---
 
 ## Evaluation Results
 
-> Populated after training. See [`training/notebooks/training.ipynb`](training/notebooks/training.ipynb) Section 7–9 and [`docs/per_class_metrics.csv`](docs/per_class_metrics.csv).
+Evaluated on held-out test set (883 images) using `runs/train53/weights/best.pt`.
 
-| Class | mAP@0.5 | Recall | Precision |
+### Per-Class Results
+
+| Class | Type | mAP@0.5 | Recall | Precision |
+|---|---|---|---|---|
+| `helmet_on` | Safe | **95.6%** | 90.2% | 94.8% |
+| `no_helmet` | ⚠ Violation | **77.9%** | 70.0% | 69.3% |
+| `vest_on` | Safe | **96.5%** | 94.1% | 87.8% |
+| `no_vest` | ⚠ Violation | **93.3%** | 88.1% | 84.0% |
+| `person` | Neutral | **79.6%** | 83.6% | 70.7% |
+| `mask_on` | Safe (bonus) | **71.9%** | 58.5% | 75.0% |
+| **Overall** | | **85.8%** | **80.8%** | **80.3%** |
+
+### Comparison: train4 → train53
+
+| Metric | train4 | train53 | Delta |
 |---|---|---|---|
-| `no_helmet` | — | — | — |
-| `no_vest` | — | — | — |
-| `helmet_on` | — | — | — |
-| `vest_on` | — | — | — |
-| `person` | — | — | — |
-| `mask_on` | — | — | — |
-| **Overall** | — | — | — |
+| mAP@50 | 79.5% | **85.8%** | +6.3pp |
+| Recall | 80.4% | **80.8%** | +0.4pp |
+| Precision | 70.7% | **80.3%** | +9.6pp |
+
+### Violation Class Focus
+
+The two safety-critical classes (no_helmet, no_vest) are the most important to evaluate honestly:
+
+- **no_helmet:** 77.9% mAP@50, 70.0% recall — weakest class. Root cause: model sometimes generates
+  mislocalized `no_helmet` boxes at torso level when the person is close-up and the helmet is at the
+  top edge of frame. Mitigated by above-adjacent suppression and anatomical position filter at inference.
+  Genuine hard cases (back-of-head angles, dark helmets in low contrast) remain as known failure modes.
+
+- **no_vest:** 93.3% mAP@50, 88.1% recall — strong. Vest is large and colourful; easier to detect.
 
 ---
 
 ## Known Failure Modes
 
-| Failure | What happens | Production fix |
-|---|---|---|
-| Night / low-light | Detection confidence drops below threshold — goes to review queue, no false alert | IR-capable cameras or supplementary lighting |
-| Far-field workers (< 40px bbox) | Flagged `UNVERIFIABLE` — no false compliance, no false alert | PTZ camera with auto-zoom |
-| Partial occlusion | Flagged `OCCLUDED_WORKER` — human review recommended | Multi-angle CCTV |
-| Dark helmet in low contrast | `no_helmet` false negative — partially mitigated by lower production threshold (0.40) | Dedicated low-contrast training data |
-| Dense crowds / overlapping boxes | Cluster flagged `CROWD_DETECTION_AMBIGUOUS` | Stereoscopic cameras |
-| Night in floodlit scenes | Model untested in this common condition — acknowledged limitation | Targeted floodlit dataset collection |
-| Geography bias | Dataset is global — PPE styles may vary regionally | Region-specific collection if deploying locally |
+| Failure | What happens | Mitigation applied | Production fix |
+|---|---|---|---|
+| Mislocalized `no_helmet` at torso | False CRITICAL alert on compliant worker | Anatomical position filter + above-adjacent suppression | More close-up training data |
+| `helmet_on` / `no_helmet` conflict | Same worker gets both classes | Conflict suppression — safe class wins | Retrain with harder negative examples |
+| Far-field workers (< 40px bbox) | Flagged UNVERIFIABLE — no false compliance | Rule 4 (explicit capability flag) | PTZ camera with auto-zoom |
+| Person class missed (close-up) | Fallback to PPE-box-only reports | Fallback path + suppression in fallback | Improved person training data |
+| Night / low-light | Conf drops below threshold → review queue | Conservative default | IR-capable cameras |
+| Partial occlusion | OCCLUDED_WORKER flag | Rule 5 | Multi-angle CCTV |
+| Dense crowds / overlapping boxes | Crowd rule fires | Rule 6 escalation | Stereoscopic cameras |
 
 ---
 
@@ -149,19 +199,13 @@ Full documentation: [`docs/DATASET.md`](docs/DATASET.md)
 - Python 3.10+
 - NVIDIA GPU (RTX 3060 or better recommended for training)
 - Docker (for API serving)
-- [Roboflow account](https://roboflow.com) — free tier is sufficient
-
----
 
 ### Step 1 — Install dependencies
 
 ```bash
 cd construction-safety-system-design
 pip install -r requirements.txt
-pip install roboflow label-studio jupyter
 ```
-
----
 
 ### Step 2 — Configure environment
 
@@ -169,207 +213,70 @@ pip install roboflow label-studio jupyter
 cp .env.example .env
 ```
 
-Edit `.env` and set your Roboflow API key:
-
+Edit `.env`:
 ```
-ROBOFLOW_API_KEY=your_actual_key_here
-MODEL_WEIGHTS_PATH=runs/train/weights/best.pt
+ROBOFLOW_API_KEY=your_key_here
+MODEL_WEIGHTS_PATH=runs/train53/weights/best.pt
+RULES_CONFIG_PATH=rules.yaml
+LOG_LEVEL=INFO
 ```
 
----
-
-### Step 3 — Download the base dataset (Roboflow)
+### Step 3 — Download datasets
 
 ```bash
-python scripts/download_dataset.py
-```
+python scripts/download_dataset.py          # Roboflow base dataset
 
-Downloads Roboflow Construction Site Safety (latest version), remaps 10 → 6 classes,
-and writes to `dataset/raw/roboflow_base/`.
-
----
-
-### Step 4 — Download Kaggle datasets
-
-Install the Kaggle CLI and place your API key at `C:\Users\YOUR_USERNAME\.kaggle\kaggle.json`
-([get it here](https://www.kaggle.com/settings) → API → Create New Token).
-
-```bash
-pip install kaggle
-
-# Dataset 1: PPE Kit Detection (~1,263 images — no_helmet / no_vest violations, YOLO format)
+# Kaggle datasets (requires kaggle CLI + API key at ~/.kaggle/kaggle.json)
 kaggle datasets download -d ketakichalke/ppe-kit-detection-construction-site-workers \
     -p dataset/raw/kaggle_ppe_kit/ --unzip
-
-# Dataset 2: Safety Vests Detection (~3,897 images — vest_on / no_vest, Pascal VOC CSV format)
 kaggle datasets download -d adilshamim8/safety-vests-detection-dataset \
     -p dataset/raw/kaggle_safety_vests/ --unzip
 ```
 
----
-
-### Step 5 — Download Roboflow scaffolding extension
-
-Already downloaded to `dataset/raw/roboflow_scaffolding/` (2,192 images — helmet_on, vest_on, person).
-
----
-
-### Step 6 — Mapping configs are pre-filled (audit complete)
-
-All four mapping files in `dataset/mappings/` have been audited against the actual downloaded files:
-
-| Dataset | Format | Mapping file | Notes |
-|---|---|---|---|
-| `roboflow_base/` | YOLO txt | `roboflow_base.yaml` | Identity mapping, already 6-class |
-| `kaggle_ppe_kit/` | YOLO txt | `kaggle_ppe_kit.yaml` | 11 classes → 6, class IDs verified |
-| `kaggle_safety_vests/` | Pascal VOC CSV | `kaggle_safety_vests.yaml` | CSV — use `convert_csv_to_yolo.py`, not `remap_labels.py` |
-| `roboflow_scaffolding/` | YOLO txt | `roboflow_scaffolding.yaml` | 8-class (corrupted data.yaml) — mapping verified from label files |
-
-No manual editing needed. Proceed to Step 7.
-
----
-
-### Step 7 — Convert and remap each dataset to the 6-class schema
+### Step 4 — Remap and merge
 
 ```bash
-# Dataset 1: Roboflow base — identity remap (already 6-class)
-python scripts/remap_labels.py \
-    --source  dataset/raw/roboflow_base/ \
-    --mapping dataset/mappings/roboflow_base.yaml \
-    --output  dataset/remapped/roboflow_base/
+python scripts/remap_labels.py --source dataset/raw/roboflow_base/     --mapping dataset/mappings/roboflow_base.yaml     --output dataset/remapped/roboflow_base/
+python scripts/remap_labels.py --source dataset/raw/kaggle_ppe_kit/     --mapping dataset/mappings/kaggle_ppe_kit.yaml     --output dataset/remapped/kaggle_ppe_kit/
+python scripts/remap_labels.py --source dataset/raw/roboflow_scaffolding/ --mapping dataset/mappings/roboflow_scaffolding.yaml --output dataset/remapped/roboflow_scaffolding/
 
-# Dataset 2: Kaggle PPE Kit — YOLO format, 11→6 class remap
-python scripts/remap_labels.py \
-    --source  dataset/raw/kaggle_ppe_kit/ \
-    --mapping dataset/mappings/kaggle_ppe_kit.yaml \
-    --output  dataset/remapped/kaggle_ppe_kit/
-
-# Dataset 3: Safety Vests — CSV format, convert first (no remap_labels.py needed)
-python scripts/convert_csv_to_yolo.py \
-    --source  dataset/raw/kaggle_safety_vests/ \
-    --output  dataset/remapped/kaggle_safety_vests/
-
-# Dataset 4: Roboflow scaffolding — YOLO format, 8→6 class remap
-python scripts/remap_labels.py \
-    --source  dataset/raw/roboflow_scaffolding/ \
-    --mapping dataset/mappings/roboflow_scaffolding.yaml \
-    --output  dataset/remapped/roboflow_scaffolding/
-```
-
-**After each run:** check the per-class log output. If `no_helmet` or `no_vest` shows 0 annotations,
-the mapping YAML has a wrong index — fix it and re-run before continuing.
-
----
-
-### Step 8 — Merge all sources into one dataset
-
-```bash
 python scripts/merge_datasets.py \
-    --sources \
-        dataset/raw/roboflow_base/ \
-        dataset/remapped/kaggle_ppe_kit/ \
-        dataset/remapped/kaggle_safety_vests/ \
-        dataset/remapped/roboflow_scaffolding/ \
-    --output dataset/merged/ \
-    --val-split 0.15 \
-    --test-split 0.10
+    --sources dataset/remapped/roboflow_base/ dataset/remapped/kaggle_ppe_kit/ \
+              dataset/remapped/kaggle_safety_vests/ dataset/remapped/roboflow_scaffolding/ \
+              dataset/remapped/roboflow_worker/ dataset/remapped/roboflow_no_helmet/ \
+              dataset/remapped/roboflow_no_vest/ \
+    --output dataset/merged/ --val-split 0.15 --test-split 0.10
+
+python scripts/make_raw_split.py
+python scripts/augment_dataset.py --data dataset/merged/data.yaml --factor 2
 ```
 
-Expected result: ~8,500 total images, `no_helmet` ≥ 1,200 and `no_vest` ≥ 2,000 train annotations.
-
----
-
-### Step 9 — Validate the merged dataset
+### Step 5 — Train
 
 ```bash
-python scripts/validate_dataset.py \
-  --data dataset/merged/data.yaml \
-  --save-report
-```
-
-Fix any issues before augmentation. Do not proceed if validation reports class ID errors or zero-count violation classes.
-
----
-
-### Step 10 — Augment training split
-
-```bash
-python scripts/augment_dataset.py \
-  --data dataset/merged/data.yaml \
-  --factor 2
-```
-
-Applies 6 offline augmentations to the train split only. Val and test splits are never augmented.
-Expected: ~6,400 train images → ~12,800 after augmentation.
-
----
-
-### Step 12 — Train (in the notebook)
-
-```bash
+# Initial training (train4)
 jupyter notebook training/notebooks/training.ipynb
+
+# Fine-tuning (train53) — run after train4 completes
+jupyter notebook "training/notebooks/Retrain with finetuning.ipynb"
 ```
 
-Open in your browser and **run all cells top-to-bottom**. Training takes ~1–3 hours on an RTX 3060.
-
-The notebook covers:
-- Baseline model (YOLOv8n, no custom extension) for comparison
-- Full training (YOLOv8m + custom extension + augmentation)
-- Training curves and loss plots inline
-- Per-class evaluation: mAP@0.5, mAP@0.5:0.95, precision, recall, F1, confusion matrix
-- Per-class commentary (what the numbers mean, real-world cost, threshold recommendation)
-- Baseline vs full model comparison table and chart
-- Failure case gallery (auto-detected false negatives on test set)
-- Precision-recall threshold trade-off discussion
-
-Trained weights are saved to `runs/train/weights/best.pt`.
-
----
-
-### Step 13 — Upload weights to GitHub Release
-
-```bash
-gh release create v1.0 runs/train/weights/best.pt \
-  --title "v1.0 — initial training" \
-  --notes "YOLOv8m trained on Roboflow v12 + custom extension"
-```
-
-Weights are stored as a GitHub Release asset, not in the repository.
-To use on another machine: download the release asset and set `MODEL_WEIGHTS_PATH` in `.env`.
-
----
-
-### Step 14 — Run the Gradio demo
+### Step 6 — Run the Gradio demo
 
 ```bash
 python demo.py
 ```
 
 Open `http://localhost:7860`. Upload a construction site image to get:
-- Annotated scene with green (compliant), red (violation), and yellow (unverifiable) boxes
-- Compliance score with colour band
-- Full structured violation report
+- Annotated scene: solid box = person anchor, dashed box = PPE violation location
+- Compliance score with colour band (COMPLIANT / CAUTION / AT RISK / CRITICAL)
+- Full structured violation report with recommended actions
 
----
-
-### Step 15 — Run the API (optional)
+### Step 7 — Run the API (optional)
 
 ```bash
-mkdir serving/weights
-cp runs/train/weights/best.pt serving/weights/
-
 docker-compose -f serving/docker-compose.yml up
-```
-
-API available at `http://localhost:8000`.
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Analyse an image
-curl -X POST http://localhost:8000/analyse \
-  -F "file=@path/to/image.jpg" | python -m json.tool
+curl -X POST http://localhost:8000/analyse -F "file=@path/to/image.jpg" | python -m json.tool
 ```
 
 ---
@@ -380,7 +287,8 @@ curl -X POST http://localhost:8000/analyse \
 pytest tests/ -v
 ```
 
-29 unit tests covering all 6 safety rules, score formula, temporal decay, and edge cases.
+29 unit tests covering all 6 safety rules, score formula, temporal decay, suppression logic,
+and edge cases. No tests touch the model — all rule logic is independently testable.
 
 ---
 
@@ -388,17 +296,25 @@ pytest tests/ -v
 
 ```
 construction-safety/
-├── scripts/           # data preparation — download, scrape, label, augment, validate
+├── scripts/           # data preparation — download, remap, merge, augment, validate
 ├── training/
 │   ├── configs/       # train_config.yaml
-│   └── notebooks/     # training.ipynb — sole training entry point
-├── inference/         # SafetyChecker, SiteScorer, Annotator, pipeline
+│   └── notebooks/     # training.ipynb (train4) + Retrain with finetuning.ipynb (train53)
+├── inference/         # SafetyChecker, SiteScorer, Annotator, pipeline, scene_classifier
 ├── serving/           # FastAPI + Dockerfile + docker-compose
-├── tests/             # pytest unit tests
-├── docs/              # DATASET.md, plots, metrics CSVs
+├── tests/             # 29 pytest unit tests
+├── docs/              # DATASET.md, per_class_metrics.csv, training curves, failure cases
+├── dataset/
+│   ├── raw/           # original downloaded sources (never modified)
+│   ├── remapped/      # label-remapped copies (6-class schema)
+│   ├── mappings/      # YAML class mapping per source
+│   └── merged/        # final unified dataset + train_raw/ split for fine-tuning
+├── runs/
+│   ├── train4/        # weights/best.pt — mAP@50=79.5%
+│   └── train53/       # weights/best.pt — mAP@50=85.8% (active)
 ├── demo.py            # Gradio demo
 ├── rules.yaml         # all thresholds — no magic numbers in inference code
-└── SAFETY_RULES.md    # formal rule specification
+├── SAFETY_RULES.md    # formal rule specification with suppression logic
 ```
 
 ---
@@ -407,14 +323,16 @@ construction-safety/
 
 | Decision | Choice | Reason |
 |---|---|---|
-| Two-stage pipeline | Person → PPE-on-crop | Isolates failure modes; easier to train PPE classifier with limited data |
-| YOLOv8m over nano | Medium model | Better small-object detection for far-field PPE; fits 6 GB VRAM |
-| COCO pretrained weights | Transfer learning | Person class already in COCO; 3× faster convergence |
-| 60% violation ratio | Intentional imbalance | Maximises recall on safety-critical classes — false negative > false positive in cost |
-| rule_confidence composite | Detection conf + bbox size + edge proximity | More trustworthy than raw YOLO score alone |
-| Heuristic scene classifier | Sky-pixel HSV detection | Zero model weight, sufficient accuracy for Rule 2 risk modulation |
+| Single-pass YOLO | All classes in one model | Simpler deployment; association by geometry is more robust than crop-based two-stage |
+| YOLOv8m | Medium model | Better small-object detection for far-field PPE; fits 6 GB VRAM with batch=16 |
+| COCO pretrained weights | Transfer learning from train4 → train53 | 10× lower lr for fine-tuning; converges in 20 epochs vs 50 |
+| `rule_confidence` composite | Detection conf + bbox size + edge proximity | More trustworthy than raw YOLO score; prevents edge-box false alerts |
+| Heuristic scene classifier | Sky-pixel HSV detection | Zero model weight, zero inference cost, sufficient for Rule 2 risk modulation |
 | Compliance score (0–100) | Score over binary flag | Site managers think in scores and trends, not event counts |
-| Lower production threshold (0.40) | For violation classes only | Asymmetric cost: false negative = injury; false positive = supervisor time |
+| `violation_conf_min = 0.40` | Lowered from 0.50 | Asymmetric cost: false negative = injury risk; false positive = supervisor time |
+| Anatomical position filter | `no_helmet` center must be in top 60% of person box | Rejects mislocalized detections where model draws violation box on torso |
+| Above-adjacent suppression | `helmet_on` above `no_helmet` → suppress regardless of confidence | Spatial evidence overrides confidence ordering for physically impossible layouts |
+| Two training runs | train4 (full aug dataset) → train53 (fine-tune raw only) | Avoids 72h full retrain; fine-tune on 6,517 raw images with online aug in ~9h |
 
 ---
 
@@ -424,5 +342,6 @@ construction-safety/
 - PTZ auto-zoom integration for far-field workers (Rule 4 production upgrade)
 - Worker re-identification across frames for persistent violation tracking
 - True zone mapping (visitor vs. active worker) beyond proximity heuristic
-- Region-specific dataset collection for Sri Lanka deployment context
+- Region-specific dataset collection for local deployment context
 - Real-time RTSP stream support for live CCTV integration
+- Undersample `kaggle_safety_vests` to improve violation class ratio (currently 22.9%, target 31%)
